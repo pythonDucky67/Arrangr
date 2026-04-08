@@ -7,6 +7,7 @@
 - 🎧 Upload MP3 or WAV audio files
 - 🎼 Automatically extract melody and chord progressions
 - 🎵 Create SATB (Soprano, Alto, Tenor, Bass) arrangements
+- 🗣️ Auto-detect solo lyrics from audio and align words to sung notes
 - 📄 Export to MusicXML format (compatible with MuseScore, Finale, Sibelius)
 - 🖥️ Easy web-based interface with drag-and-drop
 
@@ -47,7 +48,8 @@
 1. **Audio Analysis** - Extracts melody using librosa's probabilistic YIN algorithm
 2. **Chord Detection** - Analyzes chroma features to detect chord progressions
 3. **SATB Voicing** - Intelligently distributes notes across four vocal parts
-4. **MusicXML Export** - Generates a professional sheet music file
+4. **Lyric Alignment** - Transcribes solo lyrics from audio (when available) and aligns to sung measures
+5. **MusicXML Export** - Generates a professional sheet music file
 
 ## Requirements
 
