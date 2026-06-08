@@ -86,10 +86,19 @@ def detect_key(chroma: np.ndarray) -> Tuple[str, int]:
 
     # Convert root to sharps (music21 key signature)
     from music21 import key
-    if best_mode == 'major':
-        k = key.Key(best_key)
-    else:
-        k = key.Key(best_key, 'minor')
+    try:
+        best_key_int = int(best_key)
+    except Exception:
+        best_key_int = 0
+    tonic = _NOTE_NAMES[best_key_int] if 0 <= best_key_int < len(_NOTE_NAMES) else 'C'
+    try:
+        if best_mode == 'major':
+            k = key.Key(tonic)
+        else:
+            k = key.Key(tonic, 'minor')
+    except Exception as e:
+        print(f"[WARN] detect_key fallback to C major because music21 rejected tonic={tonic} mode={best_mode}: {e}")
+        k = key.Key('C')
     return best_mode, k.sharps
 
 # ----------------------------------------------------------------------
