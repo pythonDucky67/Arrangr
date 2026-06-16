@@ -12,6 +12,7 @@ import inspect
 import json
 import re
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
@@ -57,40 +58,32 @@ _TEXTURE_STYLES = {
 # ----------------------------------------------------------------------
 # Key detection
 # ----------------------------------------------------------------------
-def detect_key(chroma: np.ndarray) -> Tuple[str, int]:
+def detect_key(chroma: np.ndarray) -> Tuple[str, str, int]:
     """
     Detect key from chroma (12 bins) using Krumhansl‑Schmuckler.
-    Returns (mode, sharps) where mode is 'major' or 'minor'.
+    Returns (mode, tonic, sharps) where mode is 'major' or 'minor'.
     """
     chroma_mean = np.mean(chroma, axis=1)
     chroma_mean = chroma_mean / (np.linalg.norm(chroma_mean) + 1e-9)
 
-    best_key = None
+    best_key = 0
     best_score = -np.inf
     best_mode = 'major'
     for root in range(12):
-        # Major
         rolled = np.roll(chroma_mean, -root)
-        score = np.dot(rolled, _MAJOR_PROFILE)
-        if score > best_score:
-            best_score = score
+        maj_score = np.corrcoef(rolled, _MAJOR_PROFILE / np.linalg.norm(_MAJOR_PROFILE))[0, 1]
+        min_score = np.corrcoef(rolled, _MINOR_PROFILE / np.linalg.norm(_MINOR_PROFILE))[0, 1]
+        if maj_score > best_score:
+            best_score = maj_score
             best_key = root
             best_mode = 'major'
-        # Minor
-        rolled_min = np.roll(chroma_mean, -root)
-        score_min = np.dot(rolled_min, _MINOR_PROFILE)
-        if score_min > best_score:
-            best_score = score_min
+        if min_score > best_score:
+            best_score = min_score
             best_key = root
             best_mode = 'minor'
 
-    # Convert root to sharps (music21 key signature)
+    tonic = _NOTE_NAMES[best_key]
     from music21 import key
-    try:
-        best_key_int = int(best_key)
-    except Exception:
-        best_key_int = 0
-    tonic = _NOTE_NAMES[best_key_int] if 0 <= best_key_int < len(_NOTE_NAMES) else 'C'
     try:
         if best_mode == 'major':
             k = key.Key(tonic)
@@ -99,55 +92,192 @@ def detect_key(chroma: np.ndarray) -> Tuple[str, int]:
     except Exception as e:
         print(f"[WARN] detect_key fallback to C major because music21 rejected tonic={tonic} mode={best_mode}: {e}")
         k = key.Key('C')
-    return best_mode, k.sharps
+    return best_mode, tonic, k.sharps
 
 # ----------------------------------------------------------------------
 # Rhythm extraction from melody onsets
 # ----------------------------------------------------------------------
-def extract_melody_rhythm(y, sr, beat_times, melody_midi, beats_per_measure=4):
+
+def _quantize_duration(duration, sec_per_quarter):
+    if sec_per_quarter <= 0:
+        return 0.25
+    qdur = round((duration / sec_per_quarter) / 0.25) * 0.25
+    return max(qdur, 0.25)
+
+
+def _normalize_durations(durations, total=4.0):
+    durations = [float(d) for d in durations]
+    s = sum(durations)
+    if len(durations) == 0:
+        return [total]
+    if abs(s - total) > 0.1:
+        diff = total - s
+        for idx in range(len(durations) - 1, -1, -1):
+            if durations[idx] + diff >= 0.25:
+                durations[idx] += diff
+                break
+        else:
+            return [total]
+    return durations
+
+
+def _voice_rhythm_pattern(section, voice, solo_rhythm):
+    if voice == 'S':
+        return solo_rhythm
+    if section == 'intro':
+        return [4.0]
+    if section == 'chorus':
+        if voice == 'A':
+            return [1.0, 1.0, 1.0, 1.0]
+        if voice == 'T':
+            return [2.0, 2.0]
+        return [4.0]
+    if section == 'verse':
+        if voice == 'A':
+            return [2.0, 2.0]
+        if voice == 'T':
+            return [4.0]
+        return [4.0]
+    if section == 'bridge':
+        if voice in ('A', 'T'):
+            return [2.0, 2.0]
+        return [4.0]
+    return [4.0]
+
+
+def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo_range=(55,84)):
     """
-    Compute note durations (in quarter lengths) for each measure based on onset detection.
-    Returns list of lists: rhythm_patterns_per_measure.
+    Extract melody pitch events and durations per measure.
+    Returns melody_notes_per_measure, rhythm_patterns_per_measure.
     """
     hop = 512
+    fmin = librosa.midi_to_hz(solo_range[0])
+    fmax = librosa.midi_to_hz(solo_range[1])
+    use_py = True
+    try:
+        f0, voiced_flag, voiced_prob = librosa.pyin(y, fmin=fmin, fmax=fmax, sr=sr, hop_length=hop, fill_na=np.nan)
+    except Exception:
+        use_py = False
+        f0 = None
+        voiced_flag = None
+        voiced_prob = None
+
+    if use_py:
+        frame_times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop)
+        confident = voiced_flag & (voiced_prob >= 0.25)
+        midi_contour = np.full(len(f0), np.nan)
+        for i in np.where(confident)[0]:
+            m = 12 * np.log2(f0[i] / 440.0) + 69
+            if np.isfinite(m):
+                midi_contour[i] = int(round(m))
+        midi_smoothed = median_filter(midi_contour, size=5, mode='constant', cval=np.nan)
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+        chroma_times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop)
+    else:
+        frame_times = None
+        midi_smoothed = None
+        chroma = None
+        chroma_times = None
+
     onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop, backtrack=True)
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
-    # For each measure, find onsets within the measure and compute gaps
-    measures_rhythm = []
-    for m_idx, beat_start in enumerate(beat_times[:-1:beats_per_measure]):
-        measure_end = beat_times[min((m_idx+1)*beats_per_measure, len(beat_times)-1)]
-        # onsets inside this measure
-        ons = onset_times[(onset_times >= beat_start) & (onset_times < measure_end)]
-        if len(ons) == 0:
-            # no onsets → whole note
-            measures_rhythm.append([4.0])
+    melody = []
+    melody_rhythm = []
+    last_valid = 60
+    avg_beat = np.median(np.diff(beat_times)) if len(beat_times) > 1 else 0.5
+    for m in range(n_measures):
+        b0 = m * beats_per_measure
+        t0 = beat_times[b0]
+        if (m + 1) * beats_per_measure < len(beat_times):
+            t1 = beat_times[(m + 1) * beats_per_measure]
         else:
-            # build durations from consecutive onsets, plus final to measure end
-            durations = []
-            prev = beat_start
-            for t in ons:
-                dur = t - prev
-                if dur > 0.05:
-                    # quantize to nearest 0.25 (sixteenth)
-                    qdur = round(dur / 0.25) * 0.25
-                    if qdur > 0:
-                        durations.append(qdur)
-                prev = t
-            last_dur = measure_end - prev
-            if last_dur > 0.05:
-                qlast = round(last_dur / 0.25) * 0.25
-                if qlast > 0:
-                    durations.append(qlast)
-            # sum to 4.0 if necessary
-            total = sum(durations)
-            if abs(total - 4.0) > 0.1 and len(durations) > 0:
-                durations[-1] += (4.0 - total)
-            measures_rhythm.append(durations if durations else [4.0])
-    # if fewer measures than melody, pad
-    while len(measures_rhythm) < len(melody_midi):
-        measures_rhythm.append([4.0])
-    return measures_rhythm
+            t1 = t0 + 4 * avg_beat
+        measure_onsets = onset_times[(onset_times > t0) & (onset_times < t1)]
+        measure_pitches = []
+        measure_durations = []
+        sec_per_quarter = max((t1 - t0) / 4.0, 1e-3)
+        min_event_sec = sec_per_quarter * 0.25
+        min_allowed = t1 - min_event_sec
+        measure_onsets = measure_onsets[measure_onsets < min_allowed]
+        boundaries = [t0] + list(measure_onsets) + [t1]
+        last_onset = t0 - min_event_sec
+        for i in range(len(boundaries) - 1):
+            start = boundaries[i]
+            end = boundaries[i + 1]
+            if start - last_onset < min_event_sec:
+                continue
+            dur = end - start
+            qdur = _quantize_duration(dur, sec_per_quarter)
+            if qdur <= 0:
+                continue
+            measure_durations.append(qdur)
+            last_onset = start
+
+            pitch = None
+            if use_py and frame_times is not None:
+                mask = (frame_times >= start) & (frame_times < end)
+                vals = midi_smoothed[mask]
+                valid = vals[np.isfinite(vals)]
+                if len(valid) > 0:
+                    pitch = int(round(np.median(valid)))
+
+            if pitch is None and chroma is not None and chroma_times is not None:
+                mask_ch = (chroma_times >= start) & (chroma_times < end)
+                if mask_ch.sum() > 0:
+                    mc = chroma[:, mask_ch].mean(axis=1)
+                    pc = np.argmax(mc)
+                    pitch = 60 + pc
+            if pitch is None:
+                pitch = last_valid
+            while pitch < solo_range[0]:
+                pitch += 12
+            while pitch > solo_range[1]:
+                pitch -= 12
+            measure_pitches.append(pitch)
+            last_valid = pitch
+
+        if not measure_durations:
+            measure_durations = [4.0]
+            measure_pitches = [last_valid]
+
+        measure_durations = _normalize_durations(measure_durations)
+        melody.append(measure_pitches)
+        melody_rhythm.append(measure_durations)
+
+    return melody, melody_rhythm
+
+
+def extract_melody_chroma(y, sr, beat_times, n_measures, beats_per_measure, solo_range):
+    hop = 512
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    frame_t = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop)
+    melody = []
+    melody_rhythm = []
+    avg_beat = np.median(np.diff(beat_times)) if len(beat_times) > 1 else 0.5
+    for m in range(n_measures):
+        b0 = m * beats_per_measure
+        t0 = beat_times[b0]
+        if (m + 1) * beats_per_measure < len(beat_times):
+            t1 = beat_times[(m + 1) * beats_per_measure]
+        else:
+            t1 = t0 + 4 * avg_beat
+        mask = (frame_t >= t0) & (frame_t < t1)
+        if mask.sum() == 0:
+            pitch = 60
+            rhythm = [4.0]
+        else:
+            mc = chroma[:, mask].mean(axis=1)
+            pc = np.argmax(mc)
+            pitch = 60 + pc
+            while pitch < solo_range[0]:
+                pitch += 12
+            while pitch > solo_range[1]:
+                pitch -= 12
+            rhythm = [4.0]
+        melody.append([pitch])
+        melody_rhythm.append(rhythm)
+    return melody, melody_rhythm
 
 # ----------------------------------------------------------------------
 # Voice‑leading SATB generator (rules‑based)
@@ -295,7 +425,9 @@ def extract_tempo_beats(y, sr, beats_per_measure=4):
     result = librosa.beat.beat_track(y=y, sr=sr, start_bpm=start_bpm, trim=False, units='time')
     beat_times = result[1]
     bpm = int(round(float(np.atleast_1d(result[0])[0])))
-    # ensure whole measures
+    if len(beat_times) == 0:
+        duration = len(y) / sr
+        beat_times = np.linspace(0, duration, beats_per_measure * 4 + 1)
     n_measures = len(beat_times) // beats_per_measure
     if n_measures == 0:
         n_measures = 1
@@ -320,6 +452,7 @@ def extract_melody_pyin(y, sr, beat_times, n_measures, beats_per_measure=4, solo
     # median filter
     midi_smoothed = median_filter(midi_contour, size=5, mode='constant', cval=np.nan)
     melody = []
+    melody_rhythm = []
     for m in range(n_measures):
         b0 = m * beats_per_measure
         b1 = min(b0+beats_per_measure, len(beat_times))
@@ -329,31 +462,43 @@ def extract_melody_pyin(y, sr, beat_times, n_measures, beats_per_measure=4, solo
         vals = midi_smoothed[mask]
         valid = vals[~np.isnan(vals)]
         if len(valid) == 0:
-            melody.append(melody[-1] if melody else 60)
+            pitch = melody[-1][0] if melody else 60
         else:
-            melody.append(int(round(np.median(valid))))
-    return melody
+            pitch = int(round(np.median(valid)))
+        melody.append([pitch])
+        melody_rhythm.append([4.0])
+    return melody, melody_rhythm
 
 def extract_melody_chroma(y, sr, beat_times, n_measures, beats_per_measure, solo_range):
     hop = 512
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
     frame_t = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop)
     melody = []
+    melody_rhythm = []
+    avg_beat = np.median(np.diff(beat_times)) if len(beat_times) > 1 else 0.5
     for m in range(n_measures):
         b0 = m * beats_per_measure
-        b1 = min(b0+beats_per_measure, len(beat_times))
-        t0, t1 = beat_times[b0], beat_times[b1-1]+0.1
+        t0 = beat_times[b0]
+        if (m + 1) * beats_per_measure < len(beat_times):
+            t1 = beat_times[(m + 1) * beats_per_measure]
+        else:
+            t1 = t0 + 4 * avg_beat
         mask = (frame_t >= t0) & (frame_t < t1)
         if mask.sum() == 0:
-            melody.append(60)
-            continue
-        mc = chroma[:, mask].mean(axis=1)
-        pc = np.argmax(mc)
-        midi = 60 + pc
-        while midi < solo_range[0]: midi += 12
-        while midi > solo_range[1]: midi -= 12
-        melody.append(midi)
-    return melody
+            pitch = 60
+            rhythm = [4.0]
+        else:
+            mc = chroma[:, mask].mean(axis=1)
+            pc = np.argmax(mc)
+            pitch = 60 + pc
+            while pitch < solo_range[0]:
+                pitch += 12
+            while pitch > solo_range[1]:
+                pitch -= 12
+            rhythm = [4.0]
+        melody.append([pitch])
+        melody_rhythm.append(rhythm)
+    return melody, melody_rhythm
 
 def detect_chords(y, sr, beat_times, n_measures, beats_per_measure=4):
     hop = 512
@@ -379,9 +524,9 @@ def detect_chords(y, sr, beat_times, n_measures, beats_per_measure=4):
                     best_score, best_root, best_qual = s, root, qual
         suffix = _QUALITY_SUFFIX.get(best_qual, '')
         chords.append({'root_pc': best_root, 'quality': best_qual, 'name': f"{_NOTE_NAMES[best_root]}{suffix}"})
-    # smoothing
+    # only smooth single outliers, not every changing chord
     for i in range(1, n_measures-1):
-        if chords[i]['name'] != chords[i-1]['name'] and chords[i]['name'] != chords[i+1]['name']:
+        if chords[i-1]['name'] == chords[i+1]['name'] and chords[i]['name'] != chords[i-1]['name']:
             chords[i] = chords[i-1]
     return chords
 
@@ -468,49 +613,56 @@ def audio_to_chords_and_melody(audio_file_path, beats_per_measure=4, key_sharps=
     bpm, beat_times, n_measures = extract_tempo_beats(y, sr, beats_per_measure)
     print(f"Tempo {bpm} BPM, {n_measures} measures")
 
-    # melody
-    melody = extract_melody_pyin(y, sr, beat_times, n_measures, beats_per_measure)
-    # rhythm
-    melody_rhythm = extract_melody_rhythm(y, sr, beat_times, melody, beats_per_measure)
+    # melody with note durations per measure
+    melody, melody_rhythm = extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure)
 
     # chords
     chords = detect_chords(y, sr, beat_times, n_measures, beats_per_measure)
-    # key detection from chroma
+    # key detection from chroma and chords
     hop = 512
     chroma_full = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
-    mode, key_sharps = detect_key(chroma_full)
-    print(f"Detected key: {mode.upper()} with {key_sharps} sharps")
+    mode, tonic, key_sharps = detect_key(chroma_full)
+    root_counts = Counter(ch['root_pc'] for ch in chords)
+    if root_counts:
+        most_common_root, most_common_count = root_counts.most_common(1)[0]
+        tonic_pc = _NOTE_NAMES.index(tonic) if tonic in _NOTE_NAMES else None
+        if tonic_pc is not None and most_common_root != tonic_pc and most_common_count >= max(3, n_measures * 0.25):
+            current = key.Key(tonic) if mode == 'major' else key.Key(tonic, 'minor')
+            candidate = key.Key(_NOTE_NAMES[most_common_root])
+            if abs(candidate.sharps) <= abs(current.sharps) + 1:
+                tonic = _NOTE_NAMES[most_common_root]
+                key_sharps = candidate.sharps
+    print(f"Detected key: {mode.upper()} ({tonic}) with {key_sharps} sharps")
 
     # vocal sections
-    vocal = detect_vocal_sections(y, sr, beat_times, n_measures, beats_per_measure)
     sections = analyze_song_sections(y, sr, beat_times, n_measures, beats_per_measure)
 
     # SATB voicing with voice-leading
     voicer = SATBVoicer(mode, key_sharps)
     satb_parts = {v: [] for v in ['solo','S','A','T','B']}
     satb_parts['_sections'] = sections
-    satb_parts['_rhythm'] = {'solo': melody_rhythm}
+    satb_parts['_rhythm'] = {'solo': melody_rhythm, 'S': [], 'A': [], 'T': [], 'B': []}
 
+    vocal = detect_vocal_sections(y, sr, beat_times, n_measures, beats_per_measure)
     for m_idx in range(n_measures):
-        solo_midi = melody[m_idx] if vocal[m_idx] else None
+        solo_measure = melody[m_idx] if vocal[m_idx] else None
+        solo_rhythm = melody_rhythm[m_idx]
         section_name = sections[m_idx]
-        style = _TEXTURE_STYLES.get(section_name, _TEXTURE_STYLES['verse'])
-        if solo_midi is not None:
-            # generate SATB supporting this solo note
-            satb = voicer.voice_chord(chords[m_idx], solo_midi, section_name)
-            satb_parts['solo'].append(solo_midi)
-            satb_parts['S'].append(satb['S'])
-            satb_parts['A'].append(satb['A'])
-            satb_parts['T'].append(satb['T'])
-            satb_parts['B'].append(satb['B'])
+        if solo_measure is not None:
+            solo_target = solo_measure[0]
+            satb = voicer.voice_chord(chords[m_idx], solo_target, section_name)
+            satb_parts['solo'].append(solo_measure)
         else:
-            # no solo, SATB sings chord without melody (maybe hum)
-            satb = voicer.voice_chord(chords[m_idx], 60, section_name)  # use middle C as dummy target
+            satb = voicer.voice_chord(chords[m_idx], 60, section_name)
             satb_parts['solo'].append(None)
-            satb_parts['S'].append(satb['S'])
-            satb_parts['A'].append(satb['A'])
-            satb_parts['T'].append(satb['T'])
-            satb_parts['B'].append(satb['B'])
+        satb_parts['S'].append(satb['S'])
+        satb_parts['A'].append(satb['A'])
+        satb_parts['T'].append(satb['T'])
+        satb_parts['B'].append(satb['B'])
+        satb_parts['_rhythm']['S'].append(_voice_rhythm_pattern(section_name, 'S', solo_rhythm))
+        satb_parts['_rhythm']['A'].append(_voice_rhythm_pattern(section_name, 'A', solo_rhythm))
+        satb_parts['_rhythm']['T'].append(_voice_rhythm_pattern(section_name, 'T', solo_rhythm))
+        satb_parts['_rhythm']['B'].append(_voice_rhythm_pattern(section_name, 'B', solo_rhythm))
 
     # Optional lyrics (simplified)
     syllables = {'solo': ['ah']*n_measures, 'S':'oo', 'A':'ah', 'T':'oh', 'B':'doo'}
@@ -540,22 +692,32 @@ def build_score(parts, syllables, bpm, key_sharps, title='Arrangement', artist='
                 meas.append(key.KeySignature(key_sharps))
                 meas.append(meter.TimeSignature('4/4'))
                 meas.append(tempo.MetronomeMark(number=bpm))
+            rhythm = parts.get('_rhythm', {}).get(vkey, [[4.0]])[m_idx]
             if midi_val is None:
                 meas.append(note.Rest(quarterLength=4.0))
             else:
-                # use rhythm from solo part for all voices (simplified)
-                rhythm = parts.get('_rhythm', {}).get('solo', [[4.0]])[m_idx]
-                for dur in rhythm:
-                    n = note.Note(midi_val)
-                    n.duration.quarterLength = dur
-                    # add lyric only on first note of measure for that voice
-                    if vkey == 'B':
-                        n.lyric = _BASS_ALT[m_idx%2]
-                    elif isinstance(syllables[vkey], list) and m_idx < len(syllables[vkey]):
-                        n.lyric = syllables[vkey][m_idx]
-                    else:
-                        n.lyric = syllables.get(vkey, 'ah')
-                    meas.append(n)
+                if vkey == 'solo':
+                    pitches = midi_val if isinstance(midi_val, list) else [midi_val]
+                    for idx, dur in enumerate(rhythm):
+                        pitch = pitches[idx] if idx < len(pitches) else pitches[-1]
+                        n = note.Note(pitch)
+                        n.duration.quarterLength = dur
+                        if isinstance(syllables[vkey], list) and m_idx < len(syllables[vkey]):
+                            n.lyric = syllables[vkey][m_idx]
+                        else:
+                            n.lyric = syllables.get(vkey, 'ah')
+                        meas.append(n)
+                else:
+                    for dur in rhythm:
+                        n = note.Note(midi_val)
+                        n.duration.quarterLength = dur
+                        if vkey == 'B':
+                            n.lyric = _BASS_ALT[m_idx % 2]
+                        elif isinstance(syllables[vkey], list) and m_idx < len(syllables[vkey]):
+                            n.lyric = syllables[vkey][m_idx]
+                        else:
+                            n.lyric = syllables.get(vkey, 'ah')
+                        meas.append(n)
             part.append(meas)
         sc.append(part)
     return sc
