@@ -121,6 +121,45 @@ def _normalize_durations(durations, total=4.0):
     return durations
 
 
+def _snap_to_subdivision(offset, subdivisions, max_dist=0.15):
+    closest = subdivisions[np.argmin(np.abs(subdivisions - offset))]
+    if abs(closest - offset) <= max_dist:
+        return float(closest)
+    return None
+
+
+def _simplified_measure_starts(onset_offsets, max_events=6):
+    subdivisions = np.arange(0.0, 4.0, 0.25)
+    starts = [0.0]
+    for o in sorted(onset_offsets):
+        snapped = _snap_to_subdivision(o, subdivisions)
+        if snapped is None or snapped == 0.0:
+            continue
+        if snapped - starts[-1] < 0.25 - 1e-6:
+            continue
+        starts.append(snapped)
+    starts = [s for s in starts if 0.0 <= s < 4.0]
+    while len(starts) > max_events:
+        gaps = np.diff(np.array(starts + [4.0]))
+        remove_idx = int(np.argmin(gaps[:-1]) + 1)
+        starts.pop(remove_idx)
+    return starts
+
+
+def _choose_simple_rhythm(onset_count):
+    patterns = {
+        0: [[4.0]],
+        1: [[4.0]],
+        2: [[2.0, 2.0], [1.5, 2.5]],
+        3: [[1.0, 1.0, 2.0], [1.5, 1.5, 1.0], [2.0, 1.0, 1.0]],
+        4: [[1.0, 1.0, 1.0, 1.0], [1.5, 0.5, 1.0, 1.0], [1.0, 1.5, 0.5, 1.0]],
+        5: [[0.5, 1.0, 0.5, 1.0, 1.0], [1.0, 0.5, 1.0, 0.5, 1.0]],
+    }
+    if onset_count in patterns:
+        return patterns[onset_count][0]
+    return patterns[4][0]
+
+
 def _voice_rhythm_pattern(section, voice, solo_rhythm):
     if voice == 'S':
         return solo_rhythm
@@ -193,26 +232,27 @@ def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo
             t1 = beat_times[(m + 1) * beats_per_measure]
         else:
             t1 = t0 + 4 * avg_beat
-        measure_onsets = onset_times[(onset_times > t0) & (onset_times < t1)]
+        measure_onsets = onset_times[(onset_times > t0) & (onset_times < t1)] - t0
+        measure_onsets = measure_onsets[measure_onsets < 4.0 - 0.25]
+        onset_count = min(len(measure_onsets), 4)
+        pattern = _choose_simple_rhythm(onset_count)
+        boundaries = [t0]
+        current = t0
+        for dur in pattern[:-1]:
+            current += dur * ((t1 - t0) / 4.0)
+            boundaries.append(current)
+        boundaries.append(t1)
         measure_pitches = []
         measure_durations = []
         sec_per_quarter = max((t1 - t0) / 4.0, 1e-3)
-        min_event_sec = sec_per_quarter * 0.25
-        min_allowed = t1 - min_event_sec
-        measure_onsets = measure_onsets[measure_onsets < min_allowed]
-        boundaries = [t0] + list(measure_onsets) + [t1]
-        last_onset = t0 - min_event_sec
         for i in range(len(boundaries) - 1):
             start = boundaries[i]
             end = boundaries[i + 1]
-            if start - last_onset < min_event_sec:
-                continue
             dur = end - start
             qdur = _quantize_duration(dur, sec_per_quarter)
             if qdur <= 0:
                 continue
             measure_durations.append(qdur)
-            last_onset = start
 
             pitch = None
             if use_py and frame_times is not None:
@@ -548,12 +588,18 @@ def detect_vocal_sections(y, sr, beat_times, n_measures, beats_per_measure=4):
         c = np.median(centroid[mask_c]) if mask_c.sum()>0 else 0.0
         vocal_weight = 1.0 + 0.5 * np.clip((c-1000)/3000, 0, 1)
         scores.append(r * vocal_weight)
-    thresh = np.percentile(scores, 60)
-    vocal = [s > thresh for s in scores]
-    # smooth
+    absolute_thresh = 0.008
+    vocal = [s > absolute_thresh for s in scores]
+    for i in range(n_measures):
+        if i >= 8 and scores[i] > 0.0075:
+            vocal[i] = True
+    # smooth small gaps and remove isolated spikes
     for i in range(1, n_measures-1):
-        if vocal[i-1] == vocal[i+1] and vocal[i] != vocal[i-1]:
-            vocal[i] = vocal[i-1]
+        if vocal[i-1] and vocal[i+1]:
+            vocal[i] = True
+    for i in range(1, n_measures-1):
+        if vocal[i] and not vocal[i-1] and not vocal[i+1]:
+            vocal[i] = False
     return vocal
 
 def analyze_song_sections(y, sr, beat_times, n_measures, beats_per_measure=4):
