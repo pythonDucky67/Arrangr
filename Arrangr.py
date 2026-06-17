@@ -219,22 +219,16 @@ def _voice_rhythm_pattern(section, voice, solo_rhythm):
 
 def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo_range=(55,84), sections=None, vocal=None):
     """
-    Extract melody pitch events and durations per measure.
+    Extract one melody note per measure from dominant frequency.
+    Gate on vocal windows (return empty list for non-vocal measures).
     Returns melody_notes_per_measure, rhythm_patterns_per_measure.
     """
     hop = 512
     fmin = librosa.midi_to_hz(solo_range[0])
     fmax = librosa.midi_to_hz(solo_range[1])
-    use_py = True
+    
     try:
         f0, voiced_flag, voiced_prob = librosa.pyin(y, fmin=fmin, fmax=fmax, sr=sr, hop_length=hop, fill_na=np.nan)
-    except Exception:
-        use_py = False
-        f0 = None
-        voiced_flag = None
-        voiced_prob = None
-
-    if use_py:
         frame_times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop)
         confident = voiced_flag & (voiced_prob >= 0.25)
         midi_contour = np.full(len(f0), np.nan)
@@ -243,14 +237,16 @@ def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo
             if np.isfinite(m):
                 midi_contour[i] = int(round(m))
         midi_smoothed = median_filter(midi_contour, size=5, mode='constant', cval=np.nan)
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
-        chroma_times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop)
-    else:
+        use_pyin = True
+    except Exception:
+        use_pyin = False
         frame_times = None
         midi_smoothed = None
-        chroma = None
-        chroma_times = None
 
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    chroma_times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop)
+
+    # Detect onsets for rhythm variety
     onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop, backtrack=True)
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
 
@@ -258,6 +254,7 @@ def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo
     melody_rhythm = []
     last_valid = 60
     avg_beat = np.median(np.diff(beat_times)) if len(beat_times) > 1 else 0.5
+
     for m in range(n_measures):
         b0 = m * beats_per_measure
         t0 = beat_times[b0]
@@ -265,176 +262,50 @@ def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo
             t1 = beat_times[(m + 1) * beats_per_measure]
         else:
             t1 = t0 + 4 * avg_beat
-        measure_onsets = onset_times[(onset_times > t0) & (onset_times < t1)] - t0
-        measure_onsets = measure_onsets[measure_onsets < 4.0 - 0.25]
+
         is_vocal_measure = vocal is not None and vocal[m]
-        section_name = sections[m] if sections is not None else 'verse'
-        pattern = _choose_simple_rhythm(
-            sorted(measure_onsets.tolist()), m, section=section_name, is_vocal=is_vocal_measure
-        )
-        quarter_len = (t1 - t0) / 4.0
-        boundaries = [t0]
-        current = t0
-        for dur in pattern[:-1]:
-            current += dur * quarter_len
-            boundaries.append(current)
-        boundaries.append(t1)
-        # If this measure is non-vocal, keep it empty (solo will be gated later)
-        measure_pitches = []
-        measure_durations = []
+
         if not is_vocal_measure:
-            melody.append([])
+            # Non-vocal measure: empty solo, whole-note silence
+            melody.append(None)
             melody_rhythm.append([4.0])
             continue
 
-        # For vocal measures, prefer raw pyin-derived segments for the solo melody
-        sec_per_quarter = max((t1 - t0) / 4.0, 1e-3)
-        if use_py and frame_times is not None and midi_smoothed is not None:
-            # collect voiced frames within the measure
-            mask_voiced = (frame_times >= t0) & (frame_times < t1) & np.isfinite(midi_smoothed)
-            if mask_voiced.sum() > 0:
-                idxs = np.where(mask_voiced)[0]
-                # group contiguous frames
-                groups = np.split(idxs, np.where(np.diff(idxs) != 1)[0] + 1)
-                for g in groups:
-                    if len(g) == 0:
-                        continue
-                    dur_sec = (frame_times[g[-1]] - frame_times[g[0]]) + max(1e-3, (frame_times[1]-frame_times[0]))
-                    qdur = _quantize_duration(dur_sec, sec_per_quarter)
-                    if qdur <= 0:
-                        continue
-                    vals = midi_smoothed[g]
-                    vals = vals[np.isfinite(vals)]
-                    if len(vals) == 0:
-                        continue
-                    pitch = int(round(np.median(vals)))
-                    while pitch < solo_range[0]:
-                        pitch += 12
-                    while pitch > solo_range[1]:
-                        pitch -= 12
-                    measure_pitches.append(pitch)
-                    measure_durations.append(qdur)
+        # Vocal measure: extract one note from dominant frequency
+        pitch = None
 
-        # Fallback to pattern-based segmentation if no voiced segments found
-        if not measure_durations:
-            sec_per_quarter = max((t1 - t0) / 4.0, 1e-3)
-            boundaries = [t0]
-            current = t0
-            for dur in pattern[:-1]:
-                current += dur * sec_per_quarter
-                boundaries.append(current)
-            boundaries.append(t1)
-            for i in range(len(boundaries) - 1):
-                start = boundaries[i]
-                end = boundaries[i + 1]
-                dur = end - start
-                qdur = _quantize_duration(dur, sec_per_quarter)
-                if qdur <= 0:
-                    continue
-                measure_durations.append(qdur)
-
-                pitch = None
-                if use_py and frame_times is not None:
-                    mask = (frame_times >= start) & (frame_times < end)
-                    vals = midi_smoothed[mask]
-                    valid = vals[np.isfinite(vals)]
-                    if len(valid) > 0:
-                        pitch = int(round(np.median(valid)))
-
-                if pitch is None and chroma is not None and chroma_times is not None:
-                    mask_ch = (chroma_times >= start) & (chroma_times < end)
-                    if mask_ch.sum() > 0:
-                        mc = chroma[:, mask_ch].mean(axis=1)
-                        pc = np.argmax(mc)
-                        pitch = 60 + pc
-                if pitch is None:
-                    pitch = last_valid
-                while pitch < solo_range[0]:
-                    pitch += 12
-                while pitch > solo_range[1]:
-                    pitch -= 12
-                measure_pitches.append(pitch)
-        sec_per_quarter = max((t1 - t0) / 4.0, 1e-3)
-        for i in range(len(boundaries) - 1):
-            start = boundaries[i]
-            end = boundaries[i + 1]
-            dur = end - start
-            qdur = _quantize_duration(dur, sec_per_quarter)
-            if qdur <= 0:
-                continue
-            measure_durations.append(qdur)
-
-            pitch = None
-            if use_py and frame_times is not None:
-                mask = (frame_times >= start) & (frame_times < end)
+        if use_pyin and frame_times is not None and midi_smoothed is not None:
+            mask = (frame_times >= t0) & (frame_times < t1) & np.isfinite(midi_smoothed)
+            if mask.sum() > 0:
                 vals = midi_smoothed[mask]
-                valid = vals[np.isfinite(vals)]
-                if len(valid) > 0:
-                    pitch = int(round(np.median(valid)))
+                pitch = int(round(np.median(vals)))
 
-            if pitch is None and chroma is not None and chroma_times is not None:
-                mask_ch = (chroma_times >= start) & (chroma_times < end)
-                if mask_ch.sum() > 0:
-                    mc = chroma[:, mask_ch].mean(axis=1)
-                    pc = np.argmax(mc)
-                    pitch = 60 + pc
-            if pitch is None:
-                pitch = last_valid
-            while pitch < solo_range[0]:
-                pitch += 12
-            while pitch > solo_range[1]:
-                pitch -= 12
-            measure_pitches.append(pitch)
-            last_valid = pitch
+        if pitch is None:
+            mask_ch = (chroma_times >= t0) & (chroma_times < t1)
+            if mask_ch.sum() > 0:
+                mc = chroma[:, mask_ch].mean(axis=1)
+                pc = np.argmax(mc)
+                pitch = 60 + pc
 
-        if not measure_durations:
-            measure_durations = [4.0]
-            measure_pitches = [last_valid]
+        if pitch is None:
+            pitch = last_valid
 
-        # Merge very small fragments to avoid over-splitting the solo melody
-        i = 0
-        while i < len(measure_durations):
-            if measure_durations[i] < 0.25 and len(measure_durations) > 1:
-                if i > 0:
-                    # merge into previous
-                    measure_durations[i-1] += measure_durations[i]
-                    measure_durations.pop(i)
-                    measure_pitches.pop(i)
-                    continue
-                else:
-                    # merge into next
-                    measure_durations[i+1] += measure_durations[i]
-                    measure_durations.pop(i)
-                    measure_pitches.pop(i)
-                    continue
-            i += 1
-        measure_durations = _normalize_durations(measure_durations)
+        while pitch < solo_range[0]:
+            pitch += 12
+        while pitch > solo_range[1]:
+            pitch -= 12
 
-        # Ensure pitches and durations have matching lengths
-        if len(measure_pitches) > len(measure_durations) and len(measure_durations) > 0:
-            # compress pitch list to match durations by chunking and taking median
-            new_pitches = []
-            chunk_size = float(len(measure_pitches)) / float(len(measure_durations))
-            for i_d in range(len(measure_durations)):
-                start = int(round(i_d * chunk_size))
-                end = int(round((i_d + 1) * chunk_size))
-                if end <= start:
-                    end = min(start + 1, len(measure_pitches))
-                chunk = measure_pitches[start:end]
-                if not chunk:
-                    chunk = [measure_pitches[min(start, len(measure_pitches)-1)]]
-                new_pitches.append(int(round(np.median(chunk))))
-            measure_pitches = new_pitches
-        elif len(measure_pitches) < len(measure_durations):
-            # extend last pitch to match durations
-            if measure_pitches:
-                while len(measure_pitches) < len(measure_durations):
-                    measure_pitches.append(measure_pitches[-1])
-            else:
-                measure_pitches = [last_valid] * len(measure_durations)
+        # Choose rhythm pattern based on detected onsets in this measure
+        measure_onsets = onset_times[(onset_times > t0) & (onset_times < t1)] - t0
+        measure_onsets = measure_onsets[measure_onsets < 4.0 - 0.25]
+        section_name = sections[m] if sections is not None else 'verse'
+        rhythm_pattern = _choose_simple_rhythm(
+            sorted(measure_onsets.tolist()), m, section=section_name, is_vocal=True
+        )
 
-        melody.append(measure_pitches)
-        melody_rhythm.append(measure_durations)
+        melody.append(pitch)
+        melody_rhythm.append(rhythm_pattern)
+        last_valid = pitch
 
     return melody, melody_rhythm
 
@@ -885,8 +756,7 @@ def audio_to_chords_and_melody(audio_file_path, beats_per_measure=4, key_sharps=
         solo_rhythm = melody_rhythm[m_idx] if vocal[m_idx] else [4.0]
         section_name = sections[m_idx]
         if solo_measure is not None:
-            solo_target = solo_measure[0]
-            satb = voicer.voice_chord(chords[m_idx], solo_target, section_name)
+            satb = voicer.voice_chord(chords[m_idx], solo_measure, section_name)
             satb_parts['solo'].append(solo_measure)
         else:
             satb = voicer.voice_chord(chords[m_idx], 60, section_name)
