@@ -22,29 +22,29 @@
     </scaling>
   </defaults>
   <part-list>
-    <score-part id="P5dc186bc3567d5ff19e40d75b91eedc1">
+    <score-part id="P6ecf736f62260f87f057350035716aa9">
       <part-name>Soloist</part-name>
       <part-abbreviation>Solo</part-abbreviation>
     </score-part>
-    <score-part id="P93e092daeb54d4e173e219988e98d6b1">
+    <score-part id="P3ef79f9184877c04e0050903c2e978ae">
       <part-name>Soprano</part-name>
       <part-abbreviation>S</part-abbreviation>
     </score-part>
-    <score-part id="Pf1c57538019b53b7c718c0fc5179ad90">
+    <score-part id="P5025f8adfa40ee349babfb7200e5eb91">
       <part-name>Alto</part-name>
       <part-abbreviation>A</part-abbreviation>
     </score-part>
-    <score-part id="P534dcd5ae5dc97b83c6f383768a99efc">
+    <score-part id="P9fd5569ca2a76501eb44def169fecbb7">
       <part-name>Tenor</part-name>
       <part-abbreviation>T</part-abbreviation>
     </score-part>
-    <score-part id="P4dc923dd8a83afa30beaa0bd1977b082">
+    <score-part id="Pd028d525558185213b7643e1a96adae3">
       <part-name>Bass</part-name>
       <part-abbreviation>B</part-abbreviation>
     </score-part>
   </part-list>
   <!--=========================== Part 1 ===========================-->
-  <part id="P5dc186bc3567d5ff19e40d75b91eedc1">
+  <part id="P6ecf736f62260f87f057350035716aa9">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
@@ -5757,7 +5757,7 @@
     </measure>
   </part>
   <!--=========================== Part 2 ===========================-->
-  <part id="P93e092daeb54d4e173e219988e98d6b1">
+  <part id="P3ef79f9184877c04e0050903c2e978ae">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
@@ -11367,7 +11367,7 @@
     </measure>
   </part>
   <!--=========================== Part 3 ===========================-->
-  <part id="Pf1c57538019b53b7c718c0fc5179ad90">
+  <part id="P5025f8adfa40ee349babfb7200e5eb91">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
@@ -14621,7 +14621,7 @@
     </measure>
   </part>
   <!--=========================== Part 4 ===========================-->
-  <part id="P534dcd5ae5dc97b83c6f383768a99efc">
+  <part id="P9fd5569ca2a76501eb44def169fecbb7">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
@@ -16578,7 +16578,7 @@
     </measure>
   </part>
   <!--=========================== Part 5 ===========================-->
-  <part id="P4dc923dd8a83afa30beaa0bd1977b082">
+  <part id="Pd028d525558185213b7643e1a96adae3">
     <!--========================= Measure 1 ==========================-->
     <measure implicit="no" number="1">
       <attributes>
