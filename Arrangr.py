@@ -146,18 +146,51 @@ def _simplified_measure_starts(onset_offsets, max_events=6):
     return starts
 
 
-def _choose_simple_rhythm(onset_count):
-    patterns = {
-        0: [[4.0]],
-        1: [[4.0]],
-        2: [[2.0, 2.0], [1.5, 2.5]],
-        3: [[1.0, 1.0, 2.0], [1.5, 1.5, 1.0], [2.0, 1.0, 1.0]],
-        4: [[1.0, 1.0, 1.0, 1.0], [1.5, 0.5, 1.0, 1.0], [1.0, 1.5, 0.5, 1.0]],
-        5: [[0.5, 1.0, 0.5, 1.0, 1.0], [1.0, 0.5, 1.0, 0.5, 1.0]],
-    }
-    if onset_count in patterns:
-        return patterns[onset_count][0]
-    return patterns[4][0]
+def _choose_simple_rhythm(onset_offsets, measure_index, section='verse', is_vocal=True):
+    onset_count = min(len(onset_offsets), 5)
+    if onset_count == 0 or not is_vocal:
+        return [4.0]
+
+    strong_offset = onset_offsets[0] if len(onset_offsets) > 0 else 0.0
+    spacing = np.diff(np.concatenate(([0.0], onset_offsets, [4.0])))
+    is_chorus = (section == 'chorus')
+    is_bridge = (section == 'bridge')
+
+    if onset_count == 1:
+        if strong_offset < 0.5:
+            return [1.0, 3.0]
+        return [2.0, 2.0]
+
+    if onset_count == 2:
+        if spacing[1] < 1.0:
+            return [0.5, 1.5, 2.0]
+        if spacing[2] < 1.0:
+            return [2.0, 1.5, 0.5]
+        return [2.0, 2.0] if not is_chorus else [1.5, 0.5, 2.0]
+
+    if onset_count == 3:
+        if is_chorus:
+            return [0.5, 1.5, 1.0, 1.0]
+        if spacing[1] < 0.75:
+            return [0.5, 0.5, 2.0, 1.0]
+        return [1.0, 0.5, 2.5] if measure_index % 2 == 0 else [1.0, 1.0, 2.0]
+
+    if onset_count == 4:
+        variants = [
+            [1.0, 1.0, 1.0, 1.0],
+            [0.5, 0.5, 1.0, 2.0],
+            [1.0, 0.5, 1.5, 1.0],
+            [0.5, 1.5, 1.0, 1.0],
+        ]
+        return variants[measure_index % len(variants)]
+
+    variants = [
+        [0.5, 1.0, 0.5, 1.0, 1.0],
+        [1.0, 0.5, 1.0, 0.5, 1.0],
+        [0.5, 0.5, 1.0, 1.0, 1.0],
+        [0.5, 1.0, 0.5, 0.5, 1.5],
+    ]
+    return variants[measure_index % len(variants)]
 
 
 def _voice_rhythm_pattern(section, voice, solo_rhythm):
@@ -184,7 +217,7 @@ def _voice_rhythm_pattern(section, voice, solo_rhythm):
     return [4.0]
 
 
-def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo_range=(55,84)):
+def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo_range=(55,84), sections=None, vocal=None):
     """
     Extract melody pitch events and durations per measure.
     Returns melody_notes_per_measure, rhythm_patterns_per_measure.
@@ -234,12 +267,16 @@ def extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure=4, solo
             t1 = t0 + 4 * avg_beat
         measure_onsets = onset_times[(onset_times > t0) & (onset_times < t1)] - t0
         measure_onsets = measure_onsets[measure_onsets < 4.0 - 0.25]
-        onset_count = min(len(measure_onsets), 4)
-        pattern = _choose_simple_rhythm(onset_count)
+        is_vocal_measure = vocal is not None and vocal[m]
+        section_name = sections[m] if sections is not None else 'verse'
+        pattern = _choose_simple_rhythm(
+            sorted(measure_onsets.tolist()), m, section=section_name, is_vocal=is_vocal_measure
+        )
+        quarter_len = (t1 - t0) / 4.0
         boundaries = [t0]
         current = t0
         for dur in pattern[:-1]:
-            current += dur * ((t1 - t0) / 4.0)
+            current += dur * quarter_len
             boundaries.append(current)
         boundaries.append(t1)
         measure_pitches = []
@@ -577,23 +614,56 @@ def detect_vocal_sections(y, sr, beat_times, n_measures, beats_per_measure=4):
     rms_t = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
     centroid = librosa.feature.spectral_centroid(y=y_harm, sr=sr, hop_length=hop)[0]
     cent_t = librosa.frames_to_time(np.arange(len(centroid)), sr=sr, hop_length=hop)
+
+    try:
+        f0, voiced_flag, voiced_prob = librosa.pyin(
+            y_harm,
+            fmin=librosa.midi_to_hz(55),
+            fmax=librosa.midi_to_hz(84),
+            sr=sr,
+            hop_length=hop,
+            fill_na=np.nan
+        )
+        frame_times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop)
+        vocal_frames = voiced_flag & (voiced_prob >= 0.25)
+    except Exception:
+        frame_times = np.array([])
+        vocal_frames = np.array([])
+
+    onset_frames = librosa.onset.onset_detect(y=y_harm, sr=sr, hop_length=hop, backtrack=True)
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
+
     scores = []
+    counts = []
+    voiced_counts = []
     for m in range(n_measures):
         b0 = m * beats_per_measure
-        b1 = min(b0+beats_per_measure, len(beat_times))
-        t0, t1 = beat_times[b0], beat_times[b1-1]+0.1
+        b1 = min(b0 + beats_per_measure, len(beat_times))
+        t0, t1 = beat_times[b0], beat_times[b1-1] + 0.1
         mask_r = (rms_t >= t0) & (rms_t < t1)
         mask_c = (cent_t >= t0) & (cent_t < t1)
-        r = np.mean(rms[mask_r]) if mask_r.sum()>0 else 0.0
-        c = np.median(centroid[mask_c]) if mask_c.sum()>0 else 0.0
-        vocal_weight = 1.0 + 0.5 * np.clip((c-1000)/3000, 0, 1)
-        scores.append(r * vocal_weight)
-    absolute_thresh = 0.008
-    vocal = [s > absolute_thresh for s in scores]
-    for i in range(n_measures):
-        if i >= 8 and scores[i] > 0.0075:
-            vocal[i] = True
-    # smooth small gaps and remove isolated spikes
+        r = np.mean(rms[mask_r]) if mask_r.sum() > 0 else 0.0
+        c = np.median(centroid[mask_c]) if mask_c.sum() > 0 else 0.0
+        score = r * (1.0 + 0.5 * np.clip((c-1000) / 3000, 0, 1))
+        count = int(np.sum((onset_times >= t0) & (onset_times < t1)))
+        voiced = int(np.sum((frame_times >= t0) & (frame_times < t1) & vocal_frames)) if frame_times.size > 0 else 0
+        scores.append(score)
+        counts.append(count)
+        voiced_counts.append(voiced)
+
+    base_thresh = np.percentile(scores, 45)
+    min_thresh = max(base_thresh * 0.8, 0.005, np.percentile(scores, 30) + 0.0005)
+    vocal = []
+    for score, count, voiced in zip(scores, counts, voiced_counts):
+        if voiced >= 3 and score >= 0.004:
+            vocal.append(True)
+        elif score >= min_thresh and count >= 5:
+            vocal.append(True)
+        elif score >= 0.009 and count >= 6:
+            vocal.append(True)
+        else:
+            vocal.append(False)
+
     for i in range(1, n_measures-1):
         if vocal[i-1] and vocal[i+1]:
             vocal[i] = True
@@ -659,8 +729,14 @@ def audio_to_chords_and_melody(audio_file_path, beats_per_measure=4, key_sharps=
     bpm, beat_times, n_measures = extract_tempo_beats(y, sr, beats_per_measure)
     print(f"Tempo {bpm} BPM, {n_measures} measures")
 
-    # melody with note durations per measure
-    melody, melody_rhythm = extract_melody_line(y, sr, beat_times, n_measures, beats_per_measure)
+    # song structure and vocal activity
+    sections = analyze_song_sections(y, sr, beat_times, n_measures, beats_per_measure)
+    vocal = detect_vocal_sections(y, sr, beat_times, n_measures, beats_per_measure)
+
+    melody, melody_rhythm = extract_melody_line(
+        y, sr, beat_times, n_measures, beats_per_measure,
+        solo_range=(55,84), sections=sections, vocal=vocal
+    )
 
     # chords
     chords = detect_chords(y, sr, beat_times, n_measures, beats_per_measure)
